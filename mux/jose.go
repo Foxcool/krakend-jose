@@ -17,8 +17,16 @@ import (
 	"gopkg.in/square/go-jose.v2/jwt"
 )
 
-func HandlerFactory(hf muxkrakend.HandlerFactory, paramExtractor muxkrakend.ParamExtractor, logger logging.Logger, rejecter krakendjose.Rejecter) muxkrakend.HandlerFactory {
-	return TokenSigner(TokenSignatureValidator(hf, logger, rejecter), paramExtractor, logger)
+type FactoryParams struct {
+	NextHandlerFactory muxkrakend.HandlerFactory
+	ParamsExtractor    muxkrakend.ParamExtractor
+	Logger             logging.Logger
+	Rejecter           krakendjose.Rejecter
+	AuthEventHook      func(r *http.Request, success bool, path string, claims map[string]interface{})
+}
+
+func HandlerFactory(params FactoryParams) muxkrakend.HandlerFactory {
+	return TokenSigner(TokenSignatureValidator(params), params.ParamsExtractor, params.Logger)
 }
 
 func TokenSigner(hf muxkrakend.HandlerFactory, paramExtractor muxkrakend.ParamExtractor, logger logging.Logger) muxkrakend.HandlerFactory {
@@ -96,12 +104,12 @@ func jsonRender(w http.ResponseWriter, response *proxy.Response) error {
 	return err
 }
 
-func TokenSignatureValidator(hf muxkrakend.HandlerFactory, _ logging.Logger, rejecter krakendjose.Rejecter) muxkrakend.HandlerFactory {
-	if rejecter == nil {
-		rejecter = krakendjose.FixedRejecter(false)
+func TokenSignatureValidator(params FactoryParams) muxkrakend.HandlerFactory {
+	if params.Rejecter == nil {
+		params.Rejecter = krakendjose.FixedRejecter(false)
 	}
 	return func(cfg *config.EndpointConfig, prxy proxy.Proxy) http.HandlerFunc {
-		handler := hf(cfg, prxy)
+		handler := params.NextHandlerFactory(cfg, prxy)
 		signatureConfig, err := krakendjose.GetSignatureConfig(cfg)
 		if err != nil {
 			return handler
@@ -115,6 +123,11 @@ func TokenSignatureValidator(hf muxkrakend.HandlerFactory, _ logging.Logger, rej
 		return func(w http.ResponseWriter, r *http.Request) {
 			token, err := validator.ValidateRequest(r)
 			if err != nil {
+
+				if params.AuthEventHook != nil {
+					go params.AuthEventHook(r, false, cfg.Endpoint, nil)
+				}
+
 				http.Error(w, err.Error(), http.StatusUnauthorized)
 				return
 			}
@@ -122,18 +135,37 @@ func TokenSignatureValidator(hf muxkrakend.HandlerFactory, _ logging.Logger, rej
 			claims := map[string]interface{}{}
 			err = validator.Claims(r, token, &claims)
 			if err != nil {
+
+				if params.AuthEventHook != nil {
+					go params.AuthEventHook(r, false, cfg.Endpoint, claims)
+				}
+
 				http.Error(w, err.Error(), http.StatusUnauthorized)
 				return
 			}
 
-			if rejecter.Reject(claims) {
+			if params.Rejecter.Reject(claims) {
+
+				if params.AuthEventHook != nil {
+					go params.AuthEventHook(r, false, cfg.Endpoint, claims)
+				}
+
 				http.Error(w, "", http.StatusUnauthorized)
 				return
 			}
 
 			if !canAccess(signatureConfig.RolesKey, claims, signatureConfig.Roles) {
+
+				if params.AuthEventHook != nil {
+					go params.AuthEventHook(r, false, cfg.Endpoint, claims)
+				}
+
 				http.Error(w, "", http.StatusUnauthorized)
 				return
+			}
+
+			if params.AuthEventHook != nil {
+				go params.AuthEventHook(r, true, cfg.Endpoint, claims)
 			}
 
 			handler(w, r)
